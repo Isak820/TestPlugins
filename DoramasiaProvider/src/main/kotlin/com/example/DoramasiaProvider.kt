@@ -159,14 +159,19 @@ class DoramasiaProvider : MainAPI() {
         .replace("\\u002f", "/", ignoreCase = true)
         .replace("&amp;", "&", ignoreCase = true)
 
-    private fun isSupportedPlayerUrl(raw: String?): Boolean {
-        val value = raw ?: return false
-        val host = try { URI(value).host?.lowercase() } catch (_: Exception) { null } ?: return false
+    private fun isKnownExtractorHost(url: String): Boolean {
+        val host = try { URI(url).host?.lowercase() } catch (_: Exception) { null } ?: return false
         return host == "vidmoly.org" || host.endsWith(".vidmoly.org") ||
             host == "vidmoly.me" || host.endsWith(".vidmoly.me") ||
             host == "ok.ru" || host.endsWith(".ok.ru") ||
-            host == "odnoklassniki.ru" || host.endsWith(".odnoklassniki.ru") ||
-            value.contains(".m3u8", true) || value.contains(".mp4", true) || value.contains(".mpd", true)
+            host == "odnoklassniki.ru" || host.endsWith(".odnoklassniki.ru")
+    }
+
+    private fun isTrackingUrl(url: String): Boolean {
+        val host = try { URI(url).host?.lowercase() } catch (_: Exception) { null } ?: return true
+        return host == "mc.yandex.ru" || host.endsWith(".yandex.ru") ||
+            host == "google-analytics.com" || host.endsWith(".google-analytics.com") ||
+            host == "googletagmanager.com" || host.endsWith(".googletagmanager.com")
     }
 
     override suspend fun loadLinks(
@@ -175,71 +180,61 @@ class DoramasiaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Resolve links at playback time: signed HLS URLs can be short-lived and must not be cached here.
         val document = app.get(data).document
-        val sources = linkedSetOf<String>()
+        val candidates = linkedSetOf<String>()
 
-        fun addSource(raw: String?) {
-            val value = raw?.trim() ?: return
-            if (value.isBlank() || value.startsWith("about:", true) ||
-                value.startsWith("javascript:", true) || value.startsWith("data:", true) ||
-                value.startsWith("blob:", true)
+        fun addCandidate(raw: String?, isPlayerContainer: Boolean = false) {
+            if (raw.isNullOrBlank()) return
+            val value = normalizePlayerText(raw.trim())
+            if (value.startsWith("about:", true) || value.startsWith("javascript:", true) ||
+                value.startsWith("data:", true) || value.startsWith("blob:", true)
             ) return
             val resolved = resolveUrl(data, value) ?: return
-            if (isSupportedPlayerUrl(resolved)) sources += resolved
+            if (isTrackingUrl(resolved)) return
+
+            val path = try { URI(resolved).path.orEmpty().lowercase() } catch (_: Exception) { "" }
+            val looksLikeEmbed = isKnownExtractorHost(resolved) || isPlayerContainer ||
+                path.contains("embed") || path.contains("player") || path.contains("video")
+            if (looksLikeEmbed) candidates.add(resolved)
         }
 
-        document.select("iframe, video, source, embed, script").forEach { element ->
-            listOf(
-                "src", "data-src", "data-lazy-src", "data-video", "data-player-src",
-                "data-url", "data-original", "value", "href"
-            ).forEach { attr -> addSource(element.attr(attr)) }
-        }
+        // Read real iframe URLs and lazy-loaded player/server controls, ignoring about:blank and blob URLs.
+        document.select("iframe, [class*=player], [id*=player], [class*=server], [id*=server], [data-embed], [data-player], [data-player-src], [data-initial-src], [data-video], [data-url], [data-src]")
+            .forEach { element ->
+                val isPlayerContainer = element.tagName() == "iframe" ||
+                    element.classNames().any { it.contains("player", true) || it.contains("server", true) || it.contains("embed", true) } ||
+                    element.id().contains("player", true) || element.id().contains("server", true)
+                listOf(
+                    "src", "data-src", "data-lazy-src", "data-embed", "data-player", "data-player-src",
+                    "data-initial-src", "data-video", "data-url", "data-server", "href"
+                ).forEach { attr -> addCandidate(element.attr(attr), isPlayerContainer) }
+            }
 
-        document.select("[data-player-src], [data-initial-src], [data-video], [data-url], [data-src], [data-embed]").forEach { element ->
-            listOf("data-player-src", "data-initial-src", "data-video", "data-url", "data-src", "data-embed")
-                .forEach { addSource(element.attr(it)) }
-        }
-
+        // Some server choices are anchors; only consider player-looking links or known extractor hosts.
         document.select("a[href]").forEach { anchor ->
             val href = anchor.attr("href")
-            if (href.contains("embed") || href.contains("player") || href.contains("stream") ||
-                href.contains("m3u8") || href.contains("mp4") || href.contains("video") ||
-                href.contains("vidmoly") || href.contains("ok.ru")
-            ) addSource(href)
+            val text = "${anchor.text()} ${anchor.className()} ${anchor.id()}".lowercase()
+            val isServerLink = listOf("server", "player", "embed", "video", "vidmoly", "ok.ru").any { text.contains(it) }
+            addCandidate(href, isServerLink)
         }
 
-        val scriptText = normalizePlayerText(document.select("script").joinToString("\n") { it.data() })
-        val mediaRegex = Regex("""(?i)(https?:\/\/[^\s"'<>]+\.(?:m3u8|mp4|mpd)(?:\?[^\s"'<>]*)?)""")
-        mediaRegex.findAll(scriptText).forEach { match -> addSource(match.value) }
-
-        val playerLinkRegex = Regex("""(?i)(https?:\/\/[^\s"'<>]+(?:vidmoly\.(?:org|me)|ok\.ru|odnoklassniki\.ru)[^\s"'<>]*)""")
-        playerLinkRegex.findAll(scriptText).forEach { match -> addSource(match.value) }
-
-        val html = normalizePlayerText(document.html())
-        playerLinkRegex.findAll(html).forEach { match -> addSource(match.value) }
-
-        val hlsJsonRegex = Regex("""(?i)(?:file|src|url|source)\s*[:=]\s*[\"']?(https?:\/\/[^\"'\s<>]+\.(?:m3u8|mp4|mpd)(?:\?[^\"'\s<>]*)?)[\"']?""")
-        hlsJsonRegex.findAll(html).forEach { match -> addSource(match.groupValues.getOrNull(1)) }
-
-        if (sources.isEmpty()) {
-            val fallback = document.select("iframe").firstOrNull()?.attr("src")
-            addSource(fallback)
-        }
+        // Some pages put the selected embed URL in JSON/inline scripts instead of an iframe attribute.
+        val pageText = normalizePlayerText(document.html())
+        val embedPattern = Regex(
+            """(?i)(?:https?:)?//(?:www\.)?(?:[a-z0-9-]+\.)*(?:vidmoly\.(?:org|me)|ok\.ru|odnoklassniki\.ru)/[^\s"'<>\\]+"""
+        )
+        embedPattern.findAll(pageText).forEach { addCandidate(it.value, true) }
 
         var found = false
-        for (source in sources) {
-            val extracted = if (source.contains("vidmoly") || source.contains("ok.ru") || source.contains("odnoklassniki")) {
-                val resolved = app.get(source).document
-                val nested = linkedSetOf<String>()
-                fun collectNested(raw: String?) { addSource(raw) }
-                resolved.select("iframe, video, source, script").forEach { element ->
-                    listOf("src", "data-src", "data-video", "data-player-src", "href").forEach { collectNested(element.attr(it)) }
-                }
-                if (nested.isNotEmpty()) nested.first() else source
-            } else source
-            found = loadExtractor(extracted, data, subtitleCallback, callback) || found
+        for (embedUrl in candidates) {
+            try {
+                // Cloudstream's host extractor resolves the embed to a fresh playable URL for this playback.
+                if (loadExtractor(embedUrl, data, subtitleCallback, callback)) found = true
+            } catch (_: Exception) {
+                // Keep trying other server buttons if one embed is unavailable.
+            }
         }
-
-        return found || sources.isNotEmpty()
+        return found
     }
 }
