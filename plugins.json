@@ -1,0 +1,22 @@
+[
+    {
+        "iconUrl": "https://doramasia.net/wp-content/uploads/2026/11/favicon-doramas.png",
+        "fileHash": "sha256-a9c55944dbb79df97702da91dac5f58db8c9e22ee5452feefdf36011fe96958e",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/Isak820/TestPlugins",
+        "fileSize": 26123,
+        "status": 1,
+        "language": "es",
+        "authors": [
+            
+        ],
+        "tvTypes": [
+            "TvSeries"
+        ],
+        "version": 10,
+        "internalName": "DoramasiaProvider",
+        "description": "Cat\u00e1logo y fichas informativas de Doramasia",
+        "url": "https://raw.githubusercontent.com/Isak820/TestPlugins/builds/DoramasiaProvider.cs3",
+        "name": "DoramasiaProvider"
+    }
+]
