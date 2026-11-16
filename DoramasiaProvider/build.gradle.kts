@@ -4,7 +4,7 @@ dependencies {
 }
 
 // Increase this integer whenever a new plugin build is published.
-version = 2
+version = 3
 
 cloudstream {
     description = "Catálogo y fichas informativas de Doramasia"
