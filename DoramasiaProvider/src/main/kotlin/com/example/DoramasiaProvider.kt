@@ -1,21 +1,6 @@
 package com.example
 
-import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.ErrorLoadingException
-import com.lagradost.cloudstream3.HomePageList
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrl
-import com.lagradost.cloudstream3.newEpisode
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import com.lagradost.cloudstream3.newTvSeriesSearchResponse
+import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import java.net.URLEncoder
@@ -37,6 +22,7 @@ class DoramasiaProvider : MainAPI() {
         } else {
             "$mainUrl/explorar/page/$page/?orden=actualizados"
         }
+
         val results = searchResults(url)
         if (results.isEmpty()) throw ErrorLoadingException()
 
@@ -56,13 +42,13 @@ class DoramasiaProvider : MainAPI() {
 
     private suspend fun searchResults(url: String): List<SearchResponse> {
         return app.get(url).document.select("article.da-browser-card").mapNotNull { card ->
-            val link = card.selectFirst("a")?.attr("href")
+            val link: String? = card.selectFirst("a")?.attr("href")
                 ?.takeIf { it.startsWith("$mainUrl/doramas/") || it.startsWith("/") }
-                ?: return@mapNotNull null
-            val title = card.selectFirst(".da-browser-caption strong")?.text()
+            val title: String? = card.selectFirst(".da-browser-caption strong")?.text()
                 ?.takeIf { it.isNotBlank() }
-                ?: return@mapNotNull null
-            val poster = card.selectFirst("img")?.attr("src")
+            val poster: String? = card.selectFirst("img")?.attr("src")
+
+            if (link == null || title == null) return@mapNotNull null
 
             newTvSeriesSearchResponse(title, fixUrl(link), TvType.TvSeries) {
                 posterUrl = poster?.takeIf { it.isNotBlank() }?.let(::fixUrl)
@@ -73,25 +59,27 @@ class DoramasiaProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url).document
 
-        // If page is an episode link (/episodios/), find link back to dorama page
         if (url.contains("/episodios/")) {
-            val doramaLink = document.selectFirst("a[href*='/doramas/']")?.attr("href")
+            val doramaLink: String? = document.selectFirst("a[href*='/doramas/']")?.attr("href")
             if (doramaLink != null) {
                 document = app.get(fixUrl(doramaLink)).document
             }
         }
 
-        val title = document.selectFirst(".da-tv-overview h1")?.text()
+        val title: String = document.selectFirst(".da-tv-overview h1")?.text()
             ?.takeIf { it.isNotBlank() }
             ?: throw ErrorLoadingException()
-        val poster = document.selectFirst(".da-tv-poster img")?.attr("src")
-        val description = document.select(".da-tv-synopsis p")
+
+        val poster: String? = document.selectFirst(".da-tv-poster img")?.attr("src")
+        val description: String? = document.select(".da-tv-synopsis p")
             .joinToString("\n") { it.text() }
             .ifBlank { null }
-        val tags = document.select(".da-tv-tags .da-genre-link").map { it.text() }
+        val tags: List<String> = document.select(".da-tv-tags .da-genre-link").map { it.text() }
 
         val episodes = document.select("a.da-episode-card, a[href*='/episodios/']").mapNotNull { card ->
-            val href = card.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val href: String? = card.attr("href").takeIf { it.isNotBlank() }
+            if (href == null) return@mapNotNull null
+
             val epUrl = fixUrl(href)
             val epName = card.selectFirst(".da-episode-name")?.text()
                 ?: card.text().takeIf { it.isNotBlank() }
@@ -112,7 +100,7 @@ class DoramasiaProvider : MainAPI() {
         }.distinctBy { it.data }.reversed()
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            posterUrl = poster?.takeIf { it.isNotBlank() }?.let { fixUrl(it) }
+            posterUrl = poster?.takeIf { it.isNotBlank() }?.let(::fixUrl)
             plot = description
             this.tags = tags
         }
@@ -125,26 +113,32 @@ class DoramasiaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val sources = mutableSetOf<String>()
+        val sources = linkedSetOf<String>()
 
-        // Extract from data-player-src on server buttons
         document.select(".da-server-button, button[data-player-src]").forEach { button ->
-            val src = button.attr("data-player-src").takeIf { it.isNotBlank() }
-            if (src != null) sources.add(src)
+            val src: String? = button.attr("data-player-src").takeIf { it.isNotBlank() }
+            if (!src.isNullOrBlank()) {
+                sources += src
+            }
         }
 
-        // Extract from active player iframe
         document.select("iframe#da-active-player, iframe[data-initial-src]").forEach { iframe ->
-            val initialSrc = iframe.attr("data-initial-src").takeIf { it.isNotBlank() }
-            val src = iframe.attr("src").takeIf { it.isNotBlank() && it != "about:blank" }
-            if (initialSrc != null) sources.add(initialSrc)
-            if (src != null) sources.add(src)
+            val initialSrc: String? = iframe.attr("data-initial-src").takeIf { it.isNotBlank() }
+            val src: String? = iframe.attr("src").takeIf { it.isNotBlank() && it != "about:blank" }
+
+            if (!initialSrc.isNullOrBlank()) {
+                sources += initialSrc
+            }
+            if (!src.isNullOrBlank()) {
+                sources += src
+            }
         }
 
-        // Fallback: search all iframes
         document.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src").takeIf { it.isNotBlank() && !it.startsWith("about:") }
-            if (src != null) sources.add(src)
+            val src: String? = iframe.attr("src").takeIf { it.isNotBlank() && !it.startsWith("about:") }
+            if (!src.isNullOrBlank()) {
+                sources += src
+            }
         }
 
         for (source in sources) {
