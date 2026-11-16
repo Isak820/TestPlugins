@@ -14,6 +14,7 @@ class DoramasiaProvider : MainAPI() {
     override var name = "Doramasia"
     override var lang = "es"
     override val hasMainPage = true
+    override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.TvSeries)
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -180,7 +181,7 @@ class DoramasiaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Resolve links at playback time: signed HLS URLs can be short-lived and must not be cached here.
+        // Resolve links at playback/download time so signed media URLs are not stored in episode data.
         val document = app.get(data).document
         val candidates = linkedSetOf<String>()
 
@@ -199,7 +200,7 @@ class DoramasiaProvider : MainAPI() {
             if (looksLikeEmbed) candidates.add(resolved)
         }
 
-        // Read real iframe URLs and lazy-loaded player/server controls, ignoring about:blank and blob URLs.
+        // Read iframe, lazy-load and server-button URLs. Ignore empty, about:blank and blob player values.
         document.select("iframe, [class*=player], [id*=player], [class*=server], [id*=server], [data-embed], [data-player], [data-player-src], [data-initial-src], [data-video], [data-url], [data-src]")
             .forEach { element ->
                 val isPlayerContainer = element.tagName() == "iframe" ||
@@ -211,7 +212,7 @@ class DoramasiaProvider : MainAPI() {
                 ).forEach { attr -> addCandidate(element.attr(attr), isPlayerContainer) }
             }
 
-        // Some server choices are anchors; only consider player-looking links or known extractor hosts.
+        // Some server choices are anchors; keep only links that look player-related or use a known host.
         document.select("a[href]").forEach { anchor ->
             val href = anchor.attr("href")
             val text = "${anchor.text()} ${anchor.className()} ${anchor.id()}".lowercase()
@@ -219,22 +220,25 @@ class DoramasiaProvider : MainAPI() {
             addCandidate(href, isServerLink)
         }
 
-        // Some pages put the selected embed URL in JSON/inline scripts instead of an iframe attribute.
+        // Player URLs can be JSON-escaped in script bodies instead of visible iframe attributes.
+        val scriptText = normalizePlayerText(document.select("script").joinToString("\n") { it.data() })
         val pageText = normalizePlayerText(document.html())
         val embedPattern = Regex(
             """(?i)(?:https?:)?//(?:www\.)?(?:[a-z0-9-]+\.)*(?:vidmoly\.(?:org|me)|ok\.ru|odnoklassniki\.ru)/[^\s"'<>\\]+"""
         )
+        embedPattern.findAll(scriptText).forEach { addCandidate(it.value, true) }
         embedPattern.findAll(pageText).forEach { addCandidate(it.value, true) }
 
+        // Do not set ExtractorLink.type manually: the host extractor supplies the right VIDEO/M3U8 type and headers.
         var found = false
         for (embedUrl in candidates) {
             try {
-                // Cloudstream's host extractor resolves the embed to a fresh playable URL for this playback.
                 if (loadExtractor(embedUrl, data, subtitleCallback, callback)) found = true
             } catch (_: Exception) {
-                // Keep trying other server buttons if one embed is unavailable.
+                // Continue with any other player candidates on this episode.
             }
         }
+        // A true result means an extractor actually produced a playable/downloadable link.
         return found
     }
 }
