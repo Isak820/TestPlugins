@@ -1,0 +1,8 @@
+{
+  "name": "Cloudstream Plugins",
+  "description": "Repositorio de plugins para Cloudstream",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/isak144/TestPlugins/builds/plugins.json"
+  ]
+}
