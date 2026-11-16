@@ -4,18 +4,10 @@ dependencies {
 }
 
 // Increase this integer whenever a new plugin build is published.
-version = 9
+version = 10
 
 cloudstream {
     description = "Catálogo y fichas informativas de Doramasia"
-
-    /**
-     * Status int as one of the following:
-     * 0: Down
-     * 1: Ok
-     * 2: Slow
-     * 3: Beta-only
-     **/
     status = 1
     tvTypes = listOf("TvSeries")
     requiresResources = true

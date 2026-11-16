@@ -44,7 +44,6 @@ class DoramasiaProvider : MainAPI() {
                 anchor.attr("title")
             ).firstOrNull { !it.isNullOrBlank() }?.trim()?.takeIf { it.isNotBlank() }
                 ?: return@mapNotNull null
-
             newTvSeriesSearchResponse(title, link, TvType.TvSeries) {
                 posterUrl = imageUrl(image, url)
             }
@@ -78,7 +77,7 @@ class DoramasiaProvider : MainAPI() {
     private fun elementImageUrl(element: Element?, baseUrl: String): String? {
         if (element == null) return null
         imageUrl(if (element.tagName() == "img") element else element.selectFirst("img"), baseUrl)?.let { return it }
-        val styled = if (element.hasAttr("style")) element else element.selectFirst("[style*=" + "background-image" + "]")
+        val styled = if (element.hasAttr("style")) element else element.selectFirst("[style*=background-image]")
         val style = styled?.attr("style") ?: return null
         val raw = Regex("""(?i)background-image\s*:\s*url\([\"']?([^\"')]+)""")
             .find(style)?.groupValues?.getOrNull(1) ?: return null
@@ -97,11 +96,13 @@ class DoramasiaProvider : MainAPI() {
         return season to number
     }
 
+    private fun episodePath(url: String): String? = try {
+        URI(url).path?.takeIf { it.contains("/episodios/") }
+    } catch (_: Exception) { null }
+
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url).document
         var currentUrl = url
-
-        // An episode URL is represented in Cloudstream as its parent series, with the episode list.
         if (url.contains("/episodios/")) {
             val seriesHref = document.selectFirst(
                 "a[href*='/doramas/'], a[href*='/drama/'], a[href*='doramasia.net/doramas/']"
@@ -116,55 +117,65 @@ class DoramasiaProvider : MainAPI() {
         val title = sequenceOf(
             document.selectFirst(".da-tv-overview h1")?.text(),
             document.selectFirst("h1")?.text(),
-            document.selectFirst("meta[property='og:title']")?.attr("content"),
-            document.selectFirst("meta[property=og:title]")?.attr("content")
+            document.selectFirst("meta[property='og:title']")?.attr("content")
         ).firstOrNull { !it.isNullOrBlank() }?.trim()?.takeIf { it.isNotBlank() }
             ?: throw ErrorLoadingException()
 
-        // Avoid og:image and arbitrary page images: Doramasia may use the logo there.
+        // Deliberately avoid og:image and arbitrary page images: Doramasia may put its logo there.
         val poster = elementImageUrl(
             document.selectFirst(".da-tv-poster img, .da-tv-poster picture, .da-tv-poster, [class*=poster] img"),
             currentUrl
         )
-
         val description = document.selectFirst("meta[name=description]")?.attr("content")
             ?.takeIf { it.isNotBlank() }
             ?: document.select(".da-tv-synopsis p, .sinopsis p, .description p")
                 .firstOrNull { it.text().isNotBlank() }?.text()?.takeIf { it.isNotBlank() }
-
         val tags = document.select(".da-tv-tags .da-genre-link, .tags a, .genre a")
             .mapNotNull { it.text().trim().takeIf { text -> text.isNotBlank() } }
 
-        // Do not include da-server-button here: those are player choices, not episodes.
-        // Gather concrete episode URLs and deduplicate them regardless of the node type.
+        // Episodes are distinct from the server buttons. Accept real episode rows and actual
+        // /episodios/ links only; ignore buttons and unrelated data-url elements.
         val episodeNodes = document.select(
-            "a.da-episode-row, a.da-episode-card, a[href*='/episodios/'], " +
-                "[data-href*='/episodios/'], [data-url*='/episodios/']"
+            "a.da-episode-row, .da-episode-row a, a.da-episode-card, " +
+                "a[href*='/episodios/'], [data-href*='/episodios/'], [data-url*='/episodios/']"
         )
-        val uniqueEpisodes = LinkedHashMap<String, Element>()
+        val episodeMap = LinkedHashMap<String, Element>()
         episodeNodes.forEach { node ->
-            val href = sequenceOf(node.attr("href"), node.attr("data-href"), node.attr("data-url"))
-                .firstOrNull { it.isNotBlank() } ?: return@forEach
+            val href = sequenceOf(
+                node.attr("href"), node.attr("data-href"), node.attr("data-url"),
+                node.selectFirst("a[href*='/episodios/']")?.attr("href"),
+                node.selectFirst("a[data-href*='/episodios/']")?.attr("data-href")
+            ).firstOrNull { !it.isNullOrBlank() } ?: return@forEach
             val episodeUrl = resolveUrl(currentUrl, href) ?: return@forEach
-            val path = try { URI(episodeUrl).path.orEmpty() } catch (_: Exception) { "" }
-            if (!path.contains("/episodios/")) return@forEach
-            uniqueEpisodes.putIfAbsent(episodeUrl, node)
+            if (episodePath(episodeUrl) == null) return@forEach
+            episodeMap.putIfAbsent(episodeUrl, node)
         }
 
-        val episodes = uniqueEpisodes.map { (episodeUrl, node) ->
+        // Some Doramasia templates serialize episode links in inline scripts rather than anchors.
+        val normalizedHtml = normalizePlayerText(document.html())
+        val episodeUrlRegex = Regex(
+            """(?i)(?:https?://(?:www\.)?doramasia\.net)?(/episodios/[a-z0-9_-]+/?)(?:[\"'\s<>]|$)"""
+        )
+        episodeUrlRegex.findAll(normalizedHtml).forEach { match ->
+            val episodeUrl = resolveUrl(currentUrl, match.groupValues[1]) ?: return@forEach
+            if (episodePath(episodeUrl) != null) episodeMap.putIfAbsent(episodeUrl, document.body())
+        }
+
+        val episodes = episodeMap.map { (episodeUrl, node) ->
             val name = sequenceOf(
                 node.selectFirst(".da-episode-name")?.text(),
-                node.selectFirst(".da-episode-title, .episode-title, .title")?.text(),
+                node.selectFirst(".da-episode-title, .episode-title, .title, h3, h4")?.text(),
+                node.selectFirst("img[alt]")?.attr("alt"),
                 node.attr("aria-label"), node.attr("title"), node.text()
-            ).firstOrNull { !it.isNullOrBlank() }?.trim()?.takeIf { it.isNotBlank() } ?: "Episodio"
+            ).firstOrNull { !it.isNullOrBlank() }?.trim()?.takeIf { it.isNotBlank() }
+                ?: episodePath(episodeUrl)?.substringAfterLast('/')?.replace('-', ' ') ?: "Episodio"
             val (season, number) = episodeNumber("$name $episodeUrl")
             val thumbnail = elementImageUrl(node, currentUrl)
-
             newEpisode(episodeUrl) {
                 this.name = name
                 this.season = season
                 this.episode = number
-                // No series-poster fallback: leave the episode image empty when absent.
+                // Do not substitute the series artwork when an episode thumbnail is absent.
                 if (thumbnail != null) this.posterUrl = thumbnail
             }
         }.sortedWith(
@@ -186,16 +197,17 @@ class DoramasiaProvider : MainAPI() {
         .replace("\\u002f", "/", ignoreCase = true)
         .replace("&amp;", "&", ignoreCase = true)
 
-    private fun normalizedOkRuUrl(url: String): String {
-        // The Okru extractor accepts the videoembed form; normalize ordinary video links to it.
-        val match = Regex("""^(https?://(?:www\.|m\.)?ok\.ru)/video/(\d+)/?(?:[?#].*)?$""", RegexOption.IGNORE_CASE)
-            .find(url) ?: return url
-        return "${match.groupValues[1]}/videoembed/${match.groupValues[2]}"
-    }
-
     private fun hostOf(url: String): String? = try {
         URI(url).host?.lowercase()
     } catch (_: Exception) { null }
+
+    private fun normalizedOkRuUrl(url: String): String {
+        val match = Regex(
+            """^(https?://)(?:www\.|m\.)?ok\.ru/(?:video/|videoembed/)(\d+)/?(?:[?#].*)?$""",
+            RegexOption.IGNORE_CASE
+        ).find(url) ?: return url
+        return "${match.groupValues[1]}ok.ru/videoembed/${match.groupValues[2]}"
+    }
 
     private fun isKnownPlayerHost(url: String): Boolean {
         val host = hostOf(url) ?: return false
@@ -205,13 +217,19 @@ class DoramasiaProvider : MainAPI() {
             host == "vidmoly.me" || host.endsWith(".vidmoly.me") ||
             host == "voe.sx" || host.endsWith(".voe.sx") ||
             host == "vidara.so" || host.endsWith(".vidara.so") ||
-            host == "vidhide.com" || host.endsWith(".vidhide.com") ||
             host == "uqload.vc" || host.endsWith(".uqload.vc") ||
             host == "uqload.com" || host.endsWith(".uqload.com") ||
+            host == "vidhide.com" || host.endsWith(".vidhide.com") ||
+            host == "vidhidepro.com" || host.endsWith(".vidhidepro.com") ||
             host == "streamwish.to" || host.endsWith(".streamwish.to") ||
             host == "filemoon.sx" || host.endsWith(".filemoon.sx") ||
             host == "dood.la" || host.endsWith(".dood.la") ||
             host == "fembed.co" || host.endsWith(".fembed.co")
+    }
+
+    private fun isDirectMedia(url: String): Boolean {
+        val path = try { URI(url).path.orEmpty().lowercase() } catch (_: Exception) { "" }
+        return path.endsWith(".m3u8") || path.endsWith(".mp4") || path.endsWith(".mpd")
     }
 
     private fun isTrackingUrl(url: String): Boolean {
@@ -221,17 +239,12 @@ class DoramasiaProvider : MainAPI() {
             host == "googletagmanager.com" || host.endsWith(".googletagmanager.com")
     }
 
-    private fun isDirectMedia(url: String): Boolean {
-        val path = try { URI(url).path.orEmpty().lowercase() } catch (_: Exception) { "" }
-        return path.endsWith(".m3u8") || path.endsWith(".mp4") || path.endsWith(".mpd")
-    }
-
     private fun isSelectedServer(element: Element): Boolean {
-        val classes = element.classNames().joinToString(" ").lowercase()
+        val classes = element.classNames()
         return element.attr("aria-pressed").equals("true", true) ||
             element.attr("aria-selected").equals("true", true) ||
             element.attr("data-selected").equals("true", true) ||
-            classes.split(Regex("\\s+")).any { it in setOf("active", "selected", "current") }
+            classes.any { it.equals("active", true) || it.equals("selected", true) || it.equals("current", true) }
     }
 
     override suspend fun loadLinks(
@@ -252,13 +265,12 @@ class DoramasiaProvider : MainAPI() {
                 value.startsWith("data:", true) || value.startsWith("blob:", true)
             ) return
             val resolved = resolveUrl(data, value)?.let(::normalizedOkRuUrl) ?: return
-            if (isTrackingUrl(resolved)) return
-            if (!isKnownPlayerHost(resolved) && !isDirectMedia(resolved)) return
+            if (isTrackingUrl(resolved) || (!isKnownPlayerHost(resolved) && !isDirectMedia(resolved))) return
             if (prioritize) preferred.add(resolved) else otherCandidates.add(resolved)
         }
 
-        // Doramasia exposes server choices as button.da-server-button. Prefer the selected button,
-        // but retain the other real player buttons as fallbacks. Do not mix these with episode rows.
+        // Doramasia's observed server controls. Prefer the selected button but retain other valid
+        // server embeds as fallbacks. Never interpret these controls as episodes.
         document.select("button.da-server-button, .da-server-button").forEach { button ->
             val selected = isSelectedServer(button)
             listOf(
@@ -267,25 +279,26 @@ class DoramasiaProvider : MainAPI() {
             ).forEach { attr -> addCandidate(button.attr(attr), selected) }
         }
 
-        // Read actual player frames and player containers only; avoid scanning every page link.
+        // Real player frames/lazy player attributes only. about:blank is rejected above.
         document.select(
             "iframe[src], iframe[data-src], iframe[data-lazy-src], [data-player-src], " +
                 "[data-initial-src], [data-embed], [data-video]"
         ).forEach { element ->
-            val context = element.tagName() == "iframe" ||
+            val isPlayerContext = element.tagName() == "iframe" ||
                 element.classNames().any { it.contains("player", true) || it.contains("server", true) } ||
                 element.id().contains("player", true) || element.id().contains("server", true)
+            val priority = isPlayerContext && isSelectedServer(element)
             listOf(
                 "src", "data-src", "data-lazy-src", "data-player-src", "data-initial-src",
                 "data-embed", "data-video", "data-url"
-            ).forEach { attr -> addCandidate(element.attr(attr), context && isSelectedServer(element)) }
+            ).forEach { attr -> addCandidate(element.attr(attr), priority) }
         }
 
-        // Parse only recognized player hosts and media fields from inline scripts/JSON.
+        // Restrict script scanning to recognized embed domains or explicit media-source fields.
         val scriptText = normalizePlayerText(document.select("script").joinToString("\n") { it.data() })
         val htmlText = normalizePlayerText(document.html())
         val playerUrlPattern = Regex(
-            """(?i)(?:https?:)?//(?:www\.)?(?:[a-z0-9-]+\.)*(?:ok\.ru|odnoklassniki\.ru|vidmoly\.(?:org|me)|voe\.sx|vidara\.so|uqload\.(?:vc|com)|vidhide\.(?:com|pro)|streamwish\.to|filemoon\.sx|dood\.la|fembed\.co)/[^\s"'<>\\]+"""
+            """(?i)(?:https?:)?//(?:www\.)?(?:[a-z0-9-]+\.)*(?:ok\.ru|odnoklassniki\.ru|vidmoly\.(?:org|me)|voe\.sx|vidara\.so|uqload\.(?:vc|com)|vidhide(?:pro)?\.com|streamwish\.to|filemoon\.sx|dood\.la|fembed\.co)/[^\s"'<>\\]+"""
         )
         val directMediaPattern = Regex(
             """(?i)(?:https?:)?//[^\s"'<>\\]+\.(?:m3u8|mp4|mpd)(?:\?[^\s"'<>\\]*)?"""
@@ -293,21 +306,26 @@ class DoramasiaProvider : MainAPI() {
         val keyedMediaPattern = Regex(
             """(?i)[\"']?(?:file|src|url|source|embed|player)[\"']?\s*[:=]\s*[\"']((?:https?:)?//[^\"'\s<>]+)[\"']"""
         )
-
         for (text in listOf(scriptText, htmlText)) {
             playerUrlPattern.findAll(text).forEach { addCandidate(it.value) }
             directMediaPattern.findAll(text).forEach { addCandidate(it.value) }
             keyedMediaPattern.findAll(text).forEach { addCandidate(it.groupValues.getOrNull(1)) }
         }
 
-        var found = false
+        var emittedLinks = 0
+        val countingCallback: (ExtractorLink) -> Unit = { link ->
+            emittedLinks++
+            callback(link)
+        }
         for (source in preferred + otherCandidates) {
             try {
-                if (loadExtractor(source, data, subtitleCallback, callback)) found = true
+                // The native Cloudstream Odnoklassniki extractor expects the real videoembed URL.
+                // It handles OK.ru's current media response and supplies its required headers.
+                loadExtractor(source, data, subtitleCallback, countingCallback)
             } catch (_: Exception) {
-                // Continue with the remaining server embeds.
+                // Keep trying other servers if this host or embed is unavailable.
             }
         }
-        return found
+        return emittedLinks > 0
     }
 }
